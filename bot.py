@@ -1,14 +1,15 @@
+
 import os
 import json
 import random
 from datetime import datetime, timedelta, timezone
 
 import discord
+from aiohttp import web
 from discord.ext import commands, tasks
 
 # =========================================================
 # THE WATCHER - BLOXBERRY LABS
-# Render deployment: set DISCORD_TOKEN in Render Environment
 # =========================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
@@ -199,7 +200,9 @@ async def send_embed(message, e):
     await message.reply(embed=e, mention_author=False)
 
 
-# ---------------- Activity collection ----------------
+# =========================================================
+# ACTIVITY TRACKING
+# =========================================================
 
 def track_message(member, channel):
     u = user_data(member.id)
@@ -223,50 +226,64 @@ def track_typing(member, channel):
     save_data()
 
 
-# ---------------- Live leaderboard ----------------
+# =========================================================
+# LIVE LEADERBOARD
+# =========================================================
 
 def make_leaderboard(guild):
     staff = staff_members(guild)
     staff.sort(key=lambda m: activity_score(m.id), reverse=True)
+
     e = embed(
         "The Watcher | Staff Leaderboard",
         "Live staff activity rankings. This message refreshes every 60 seconds."
     )
+
     if not staff:
         e.description = "No staff members found."
         return e
 
     rows = []
+
     for rank, member in enumerate(staff[:25], 1):
         u = user_data(member.id)
+
         rows.append(
             f"**{rank}. {discord.utils.escape_markdown(member.display_name)}**\n"
             f"{member.mention} · Messages: `{u['messages']:,}` · "
             f"Typing: `{u['typing_events']:,}` · Score: `{activity_score(member.id):,}`"
         )
+
     e.description = "\n\n".join(rows)
     e.add_field(name="Staff tracked", value=str(len(staff)), inline=True)
     e.add_field(name="Excluded roles", value="Member and Pending Application", inline=True)
+
     return e
 
 
 async def refresh_leaderboards():
     changed = False
+
     for item in data["leaderboards"][:]:
         guild = bot.get_guild(item["guild_id"])
         channel = guild.get_channel(item["channel_id"]) if guild else None
+
         if not channel:
             data["leaderboards"].remove(item)
             changed = True
             continue
+
         try:
             msg = await channel.fetch_message(item["message_id"])
             await msg.edit(embed=make_leaderboard(guild))
+
         except discord.NotFound:
             data["leaderboards"].remove(item)
             changed = True
+
         except discord.HTTPException as exc:
             print(f"Leaderboard refresh error: {exc}")
+
     if changed:
         save_data()
 
@@ -276,26 +293,33 @@ async def leaderboard_loop():
     await refresh_leaderboards()
 
 
-# ---------------- Bump reminder ----------------
-# Discord bots cannot invoke another bot's user slash command.
-# This sends a reminder for a human moderator to run /bump.
+# =========================================================
+# DISBOARD BUMP REMINDER
+# =========================================================
 
 def schedule_next_bump():
     delay_seconds = 2 * 60 * 60 + random.randint(60, 120)
-    data["next_bump_reminder"] = (utcnow() + timedelta(seconds=delay_seconds)).isoformat()
+
+    data["next_bump_reminder"] = (
+        utcnow() + timedelta(seconds=delay_seconds)
+    ).isoformat()
+
     save_data()
 
 
 @tasks.loop(seconds=30)
 async def bump_reminder_loop():
     due = parse_time(data.get("next_bump_reminder"))
+
     if due is None:
         schedule_next_bump()
         return
+
     if utcnow() < due:
         return
 
     channel = bot.get_channel(BUMP_CHANNEL_ID)
+
     if channel is None:
         try:
             channel = await bot.fetch_channel(BUMP_CHANNEL_ID)
@@ -315,14 +339,20 @@ async def bump_reminder_loop():
     schedule_next_bump()
 
 
-# ---------------- Commands ----------------
+# =========================================================
+# WATCHER HELP
+# =========================================================
 
 async def cmd_help(message):
-    e = embed("The Watcher | Command Centre", "Commands available to authorized staff.")
+    e = embed(
+        "The Watcher | Command Centre",
+        "Commands available to authorized staff."
+    )
+
     commands_list = [
         ("watcherhelp", "Show all Watcher commands."),
         ("watcher @user", "Show a member's activity report."),
-        ("watcher leaderboard", "Post a live staff leaderboard; it updates every 60 seconds."),
+        ("watcher leaderboard", "Post a live staff leaderboard."),
         ("watcher staff", "Show overall staff activity."),
         ("watcher inactive", "List staff with no recorded activity for 7+ days."),
         ("watcher history @user", "Show the member's latest recorded activity events."),
@@ -331,78 +361,151 @@ async def cmd_help(message):
         ("watcher alerts", "Show recent security alerts."),
         ("watcher report", "Generate a rolling 7-day activity report.")
     ]
+
     for name, desc in commands_list:
         e.add_field(name=name, value=desc, inline=False)
+
     e.add_field(
         name="Access",
         value="Only members with the authorized Watcher role can use commands.",
         inline=False
     )
+
     await send_embed(message, e)
 
+
+# =========================================================
+# WATCHER USER REPORT
+# =========================================================
 
 async def cmd_user(message):
     target = await get_target(message)
+
     if not target:
-        return await message.reply("Mention a member. Example: `watcher @user`", mention_author=False)
+        return await message.reply(
+            "Mention a member. Example: `watcher @user`",
+            mention_author=False
+        )
+
     u = user_data(target.id)
-    e = embed(f"The Watcher | {target.display_name}", f"Activity report for {target.mention}")
+
+    e = embed(
+        f"The Watcher | {target.display_name}",
+        f"Activity report for {target.mention}"
+    )
+
     e.set_thumbnail(url=target.display_avatar.url)
+
     e.add_field(name="Messages", value=f"`{u['messages']:,}`", inline=True)
     e.add_field(name="Typing events", value=f"`{u['typing_events']:,}`", inline=True)
     e.add_field(name="Activity score", value=f"`{activity_score(target.id):,}`", inline=True)
+
     e.add_field(name="Last activity", value=relative_time(u["last_activity"]), inline=False)
     e.add_field(name="Last message", value=relative_time(u["last_message"]), inline=True)
     e.add_field(name="Last typing", value=relative_time(u["last_typing"]), inline=True)
-    e.add_field(name="Staff member", value="Yes" if is_staff(target) else "No", inline=True)
+
+    e.add_field(
+        name="Staff member",
+        value="Yes" if is_staff(target) else "No",
+        inline=True
+    )
+
     last_typing = parse_time(u["last_typing"])
-    typing_now = bool(last_typing and (utcnow() - last_typing).total_seconds() <= TYPING_ACTIVE_SECONDS)
-    e.add_field(name="Typing status", value="Recently typing" if typing_now else "Not recently typing", inline=True)
+
+    typing_now = bool(
+        last_typing
+        and (utcnow() - last_typing).total_seconds() <= TYPING_ACTIVE_SECONDS
+    )
+
+    e.add_field(
+        name="Typing status",
+        value="Recently typing" if typing_now else "Not recently typing",
+        inline=True
+    )
+
     await send_embed(message, e)
 
 
+# =========================================================
+# WATCHER LEADERBOARD COMMAND
+# =========================================================
+
 async def cmd_leaderboard(message):
     sent = await message.channel.send(embed=make_leaderboard(message.guild))
+
     data["leaderboards"] = [
-        x for x in data["leaderboards"] if x["message_id"] != sent.id
+        x for x in data["leaderboards"]
+        if x["message_id"] != sent.id
     ]
+
     data["leaderboards"].append({
         "guild_id": message.guild.id,
         "channel_id": message.channel.id,
         "message_id": sent.id
     })
+
     save_data()
 
 
+# =========================================================
+# WATCHER STAFF OVERVIEW
+# =========================================================
+
 async def cmd_staff(message):
     staff = staff_members(message.guild)
+
     total_messages = sum(user_data(m.id)["messages"] for m in staff)
     total_typing = sum(user_data(m.id)["typing_events"] for m in staff)
+
     active_typing = 0
+
     for m in staff:
         last = parse_time(user_data(m.id)["last_typing"])
+
         if last and (utcnow() - last).total_seconds() <= TYPING_ACTIVE_SECONDS:
             active_typing += 1
-    e = embed("The Watcher | Staff Overview", "Activity overview of tracked staff.")
+
+    e = embed(
+        "The Watcher | Staff Overview",
+        "Activity overview of tracked staff."
+    )
+
     e.add_field(name="Total staff", value=str(len(staff)), inline=True)
     e.add_field(name="Recently typing", value=str(active_typing), inline=True)
     e.add_field(name="Total messages", value=f"{total_messages:,}", inline=True)
     e.add_field(name="Typing events", value=f"{total_typing:,}", inline=True)
+
     await send_embed(message, e)
 
 
+# =========================================================
+# WATCHER INACTIVE STAFF
+# =========================================================
+
 async def cmd_inactive(message):
     inactive = []
+
     for member in staff_members(message.guild):
         last = parse_time(user_data(member.id)["last_activity"])
+
         if last is None:
             inactive.append((member, None))
         else:
             days = (utcnow() - last).days
+
             if days >= INACTIVE_DAYS:
                 inactive.append((member, days))
-    inactive.sort(key=lambda item: item[1] if item[1] is not None else 999999, reverse=True)
-    e = embed("The Watcher | Inactive Staff", f"Staff with no recorded activity for {INACTIVE_DAYS}+ days.")
+
+    inactive.sort(
+        key=lambda item: item[1] if item[1] is not None else 999999,
+        reverse=True
+    )
+
+    e = embed(
+        "The Watcher | Inactive Staff",
+        f"Staff with no recorded activity for {INACTIVE_DAYS}+ days."
+    )
+
     if not inactive:
         e.description = "No inactive staff members found."
     else:
@@ -410,15 +513,33 @@ async def cmd_inactive(message):
             f"{m.mention} — `{'No recorded activity' if days is None else str(days) + ' days inactive'}`"
             for m, days in inactive[:25]
         )
+
     await send_embed(message, e)
 
 
+# =========================================================
+# WATCHER MEMBER HISTORY
+# =========================================================
+
 async def cmd_history(message):
     target = await get_target(message, 2)
+
     if not target:
-        return await message.reply("Use `watcher history @user`.", mention_author=False)
-    events = [x for x in data["events"] if x["user_id"] == str(target.id)][-15:]
-    e = embed(f"The Watcher | History: {target.display_name}", "Latest recorded events.")
+        return await message.reply(
+            "Use `watcher history @user`.",
+            mention_author=False
+        )
+
+    events = [
+        x for x in data["events"]
+        if x["user_id"] == str(target.id)
+    ][-15:]
+
+    e = embed(
+        f"The Watcher | History: {target.display_name}",
+        "Latest recorded events."
+    )
+
     if not events:
         e.description = "No activity history recorded."
     else:
@@ -427,31 +548,73 @@ async def cmd_history(message):
             f"{relative_time(x['time'])}"
             for x in reversed(events)
         )
+
     await send_embed(message, e)
 
+
+# =========================================================
+# WATCHER MEMBER COMPARISON
+# =========================================================
 
 async def cmd_compare(message):
     if len(message.mentions) < 2:
-        return await message.reply("Use `watcher compare @user1 @user2`.", mention_author=False)
+        return await message.reply(
+            "Use `watcher compare @user1 @user2`.",
+            mention_author=False
+        )
+
     first, second = message.mentions[:2]
-    e = embed("The Watcher | Member Comparison", f"{first.mention} vs {second.mention}")
+
+    e = embed(
+        "The Watcher | Member Comparison",
+        f"{first.mention} vs {second.mention}"
+    )
+
     for member in (first, second):
         u = user_data(member.id)
+
         e.add_field(
             name=member.display_name,
-            value=f"Messages: `{u['messages']:,}`\nTyping: `{u['typing_events']:,}`\nScore: `{activity_score(member.id):,}`",
+            value=(
+                f"Messages: `{u['messages']:,}`\n"
+                f"Typing: `{u['typing_events']:,}`\n"
+                f"Score: `{activity_score(member.id):,}`"
+            ),
             inline=True
         )
+
     await send_embed(message, e)
 
 
+# =========================================================
+# WATCHER SECURITY OVERVIEW
+# =========================================================
+
 async def cmd_security(message):
     cutoff = utcnow() - timedelta(days=7)
-    recent = [x for x in data["alerts"] if parse_time(x["time"]) and parse_time(x["time"]) >= cutoff]
-    e = embed("The Watcher | Security Overview", "Recorded server events from the last 7 days.")
+
+    recent = [
+        x for x in data["alerts"]
+        if parse_time(x["time"]) and parse_time(x["time"]) >= cutoff
+    ]
+
+    e = embed(
+        "The Watcher | Security Overview",
+        "Recorded server events from the last 7 days."
+    )
+
     e.add_field(name="Recent alerts", value=str(len(recent)), inline=True)
-    e.add_field(name="Server members", value=str(message.guild.member_count or len(message.guild.members)), inline=True)
-    e.add_field(name="Tracked staff", value=str(len(staff_members(message.guild))), inline=True)
+    e.add_field(
+        name="Server members",
+        value=str(message.guild.member_count or len(message.guild.members)),
+        inline=True
+    )
+    e.add_field(
+        name="Tracked staff",
+        value=str(len(staff_members(message.guild))),
+        inline=True
+    )
+
     e.add_field(
         name="Monitored events",
         value=(
@@ -463,12 +626,22 @@ async def cmd_security(message):
         ),
         inline=False
     )
+
     await send_embed(message, e)
 
 
+# =========================================================
+# WATCHER SECURITY ALERTS
+# =========================================================
+
 async def cmd_alerts(message):
     alerts = data["alerts"][-15:]
-    e = embed("The Watcher | Security Alerts", "Most recent recorded alerts.")
+
+    e = embed(
+        "The Watcher | Security Alerts",
+        "Most recent recorded alerts."
+    )
+
     if not alerts:
         e.description = "No security alerts recorded."
     else:
@@ -476,40 +649,62 @@ async def cmd_alerts(message):
             f"**{x['description']}**\n{relative_time(x['time'])}"
             for x in reversed(alerts)
         )
+
     await send_embed(message, e)
 
+
+# =========================================================
+# WATCHER WEEKLY REPORT
+# =========================================================
 
 async def cmd_report(message):
     cutoff = utcnow() - timedelta(days=7)
     staff = staff_members(message.guild)
     active = 0
+
     for m in staff:
         last = parse_time(user_data(m.id)["last_activity"])
+
         if last and last >= cutoff:
             active += 1
 
     messages = 0
     typing = 0
+
     for day, members in data["daily"].items():
         try:
             date = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except ValueError:
             continue
+
         if date >= cutoff:
             for stats in members.values():
                 messages += stats.get("messages", 0)
                 typing += stats.get("typing", 0)
 
-    alerts = [x for x in data["alerts"] if parse_time(x["time"]) and parse_time(x["time"]) >= cutoff]
-    e = embed("The Watcher | Weekly Report", "Rolling 7-day staff activity report.")
+    alerts = [
+        x for x in data["alerts"]
+        if parse_time(x["time"]) and parse_time(x["time"]) >= cutoff
+    ]
+
+    e = embed(
+        "The Watcher | Weekly Report",
+        "Rolling 7-day staff activity report."
+    )
+
     e.add_field(name="Total staff", value=str(len(staff)), inline=True)
     e.add_field(name="Active staff", value=str(active), inline=True)
     e.add_field(name="No activity", value=str(len(staff) - active), inline=True)
     e.add_field(name="Messages", value=f"{messages:,}", inline=True)
     e.add_field(name="Typing events", value=f"{typing:,}", inline=True)
     e.add_field(name="Security alerts", value=str(len(alerts)), inline=True)
+
     await send_embed(message, e)
 
+
+# =========================================================
+# COMMAND ROUTER
+# =========================================================
 
 async def handle_watcher_command(message):
     content = message.content.strip()
@@ -543,13 +738,52 @@ async def handle_watcher_command(message):
     elif message.mentions or (len(parts) > 1 and parts[1].isdigit()):
         await cmd_user(message)
     else:
-        await message.reply("Unknown command. Use `watcherhelp`.", mention_author=False)
+        await message.reply(
+            "Unknown command. Use `watcherhelp`.",
+            mention_author=False
+        )
 
 
-# ---------------- Discord events ----------------
+# =========================================================
+# KEEPALIVE WEB SERVER
+# =========================================================
+
+web_runner = None
+
+
+async def keepalive(request):
+    return web.Response(text="anshuman hi")
+
+
+async def start_webserver():
+    global web_runner
+
+    if web_runner is not None:
+        return
+
+    app = web.Application()
+    app.router.add_get("/", keepalive)
+    app.router.add_get("/health", keepalive)
+
+    web_runner = web.AppRunner(app)
+    await web_runner.setup()
+
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(web_runner, "0.0.0.0", port)
+
+    await site.start()
+
+    print(f"Keepalive server running on port {port}")
+
+
+# =========================================================
+# BOT READY
+# =========================================================
 
 @bot.event
 async def on_ready():
+    await start_webserver()
+
     print("=" * 45)
     print("THE WATCHER IS ONLINE")
     print(f"Logged in as: {bot.user}")
@@ -558,6 +792,7 @@ async def on_ready():
     print("=" * 45)
 
     guild = bot.get_guild(SERVER_ID)
+
     if guild:
         print(f"Connected to: {guild.name}")
         print(f"Cached members: {len(guild.members)}")
@@ -567,9 +802,14 @@ async def on_ready():
 
     if not leaderboard_loop.is_running():
         leaderboard_loop.start()
+
     if not bump_reminder_loop.is_running():
         bump_reminder_loop.start()
 
+
+# =========================================================
+# MESSAGE EVENTS
+# =========================================================
 
 @bot.event
 async def on_message(message):
@@ -592,20 +832,31 @@ async def on_message(message):
                 mention_author=False
             )
             return
+
         await handle_watcher_command(message)
         return
 
     track_message(message.author, message.channel)
 
 
+# =========================================================
+# TYPING EVENTS
+# =========================================================
+
 @bot.event
 async def on_typing(channel, user, when):
     guild = getattr(channel, "guild", None)
+
     if not guild or guild.id != SERVER_ID or user.bot:
         return
+
     if isinstance(user, discord.Member):
         track_typing(user, channel)
 
+
+# =========================================================
+# MEMBER UPDATES
+# =========================================================
 
 @bot.event
 async def on_member_update(before, after):
@@ -614,13 +865,19 @@ async def on_member_update(before, after):
 
     old = {r.id for r in before.roles}
     new = {r.id for r in after.roles}
+
     added = new - old
     removed = old - new
 
     if added or removed:
         added_names = [r.name for r in after.roles if r.id in added]
         removed_names = [r.name for r in before.roles if r.id in removed]
-        description = f"Role changes for {after}: added {added_names}; removed {removed_names}"
+
+        description = (
+            f"Role changes for {after}: "
+            f"added {added_names}; removed {removed_names}"
+        )
+
         add_event(after.id, "role_change", description)
         add_alert(description, after.id)
 
@@ -644,6 +901,10 @@ async def on_member_remove(member):
         add_alert(f"Member left: {member}", member.id)
 
 
+# =========================================================
+# ROLE MONITORING
+# =========================================================
+
 @bot.event
 async def on_guild_role_create(role):
     if role.guild.id == SERVER_ID:
@@ -662,6 +923,10 @@ async def on_guild_role_update(before, after):
         add_alert(f"Permissions changed for role: {after.name}")
 
 
+# =========================================================
+# CHANNEL MONITORING
+# =========================================================
+
 @bot.event
 async def on_guild_channel_create(channel):
     if channel.guild.id == SERVER_ID:
@@ -678,17 +943,27 @@ async def on_guild_channel_delete(channel):
 async def on_guild_channel_update(before, after):
     if after.guild.id != SERVER_ID:
         return
+
     if before.name != after.name:
         add_alert(f"Channel renamed: {before.name} -> {after.name}")
+
     if before.overwrites != after.overwrites:
         add_alert(f"Channel permission changes: {after.name}")
 
+
+# =========================================================
+# WEBHOOK MONITORING
+# =========================================================
 
 @bot.event
 async def on_webhooks_update(channel):
     if channel.guild.id == SERVER_ID:
         add_alert(f"Webhook configuration changed in #{channel.name}")
 
+
+# =========================================================
+# MESSAGE DELETION MONITORING
+# =========================================================
 
 @bot.event
 async def on_message_delete(message):
@@ -709,14 +984,23 @@ async def on_bulk_message_delete(messages):
             )
 
 
+# =========================================================
+# ERROR HANDLING
+# =========================================================
+
 @bot.event
 async def on_error(event, *args, **kwargs):
     print(f"Event error: {event}")
 
 
+# =========================================================
+# RUN THE WATCHER
+# =========================================================
+
 if __name__ == "__main__":
-    if not TOKEN or TOKEN == "PASTE_YOUR_NEW_BOT_TOKEN_HERE":
+    if not TOKEN:
         raise RuntimeError(
             "Set DISCORD_TOKEN in Render Environment before starting The Watcher."
         )
+
     bot.run(TOKEN)
